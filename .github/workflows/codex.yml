@@ -173,6 +173,8 @@ jobs:
           cat > "$CODEX_CONFIG_DIR/config.toml" <<'CONFIG'
           [mcp_servers.tidewave]
           url = "${{ steps.tidewave.outputs.mcp_url }}"
+          required = true
+          default_tools_approval_mode = "approve"
 
           [permissions.tidewave]
           extends = ":workspace"
