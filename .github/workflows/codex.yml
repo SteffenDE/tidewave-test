@@ -1,6 +1,8 @@
 name: Codex with Tidewave and bot pull requests
 
 on:
+  issues:
+    types: [opened]
   issue_comment:
     types: [created]
 
@@ -11,8 +13,11 @@ concurrency:
 jobs:
   codex:
     if: |
-      github.event.sender.login == 'SteffenDE' &&
-      startsWith(github.event.comment.body, '/tidewave ')
+      github.event.sender.login == 'SteffenDE' && (
+        (github.event_name == 'issues' &&
+            (contains(github.event.issue.title, '/tidewave') || contains(github.event.issue.body, '/tidewave'))) ||
+        (github.event_name == 'issue_comment' && startsWith(github.event.comment.body, '/tidewave '))
+      )
     outputs:
       base_sha: ${{ steps.base.outputs.sha }}
       branch: ${{ steps.task.outputs.branch }}
@@ -121,7 +126,8 @@ jobs:
           GH_REPO: ${{ github.repository }}
           NUMBER: ${{ github.event.issue.number }}
           KIND: ${{ steps.task.outputs.kind }}
-          REQUEST: ${{ github.event.comment.body }}
+          REQUEST: >-
+            ${{ github.event.comment.body || format('{0}: {1}', github.event.issue.title, github.event.issue.body || '') }}
         run: |
           gh "$KIND" view "$NUMBER" --json title,body,comments > tmp/tidewave-context.json
           if [ "$KIND" = pr ]; then
