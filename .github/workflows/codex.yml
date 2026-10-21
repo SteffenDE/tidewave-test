@@ -1,0 +1,301 @@
+name: Codex with Tidewave and bot pull requests
+
+on:
+  issue_comment:
+    types: [created]
+
+concurrency:
+  group: tidewave-${{ github.workflow }}-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  codex:
+    if: |
+      startsWith(github.event.comment.body, '/tidewave ')
+    outputs:
+      base_sha: ${{ steps.base.outputs.sha }}
+      branch: ${{ steps.task.outputs.branch }}
+      kind: ${{ steps.task.outputs.kind }}
+      changes: ${{ steps.changes.outputs.present }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Resolve task
+        id: task
+        env:
+          GH_TOKEN: ${{ secrets.GH_COMMENT_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.issue.number }}
+          IS_PR: ${{ github.event.issue.pull_request && 'true' || 'false' }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          if [ "$IS_PR" = false ]; then
+            echo "kind=issue" >> "$GITHUB_OUTPUT"
+            echo "ref=$DEFAULT_BRANCH" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          bot_login="$(gh api user --jq .login)"
+          gh api "repos/$GH_REPO/pulls/$NUMBER" > "$RUNNER_TEMP/tidewave-pr.json"
+          if ! jq -e --arg bot "$bot_login" --arg repo "$GH_REPO" '
+            .state == "open" and .user.login == $bot and
+            .head.repo.full_name == $repo and
+            (.head.ref | startswith("bot/tidewave-"))
+          ' "$RUNNER_TEMP/tidewave-pr.json" > /dev/null; then
+            echo "Only open bot PRs on this repository's bot/tidewave- branches are supported"
+            exit 1
+          fi
+          echo "kind=pr" >> "$GITHUB_OUTPUT"
+          jq -r '"ref=" + .head.sha, "branch=" + .head.ref' \
+            "$RUNNER_TEMP/tidewave-pr.json" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ steps.task.outputs.ref }}
+
+      - name: Record base commit
+        id: base
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          printf '/tmp/\n' >> .git/info/exclude
+
+      - name: Set up Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.19"
+          otp-version: "28"
+
+      - name: Cache deps and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: ${{ runner.os }}-mix-dev-${{ hashFiles('mix.lock') }}
+          restore-keys: ${{ runner.os }}-mix-dev-
+
+      - name: Set up the app
+        run: mix setup
+
+      # Tidewave is a dev-only dependency, so the server runs in the dev environment
+      # The loop restarts the server whenever it exits, so the agent can restart it
+      - name: Start the app
+        run: |
+          mkdir -p tmp
+          (while true; do
+            mix phx.server || echo "The app exited with status $?"
+            echo "Restarting the app"
+            sleep 1
+          done) > tmp/app.log 2>&1 &
+
+      - name: Connect Tidewave
+        id: tidewave
+        uses: tidewave-ai/connect-action@v1
+        with:
+          app_url: http://localhost:4000
+          api_key: ${{ secrets.TIDEWAVE_API_KEY }}
+
+      - name: Prepare Codex prompt
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.issue.number }}
+          KIND: ${{ steps.task.outputs.kind }}
+          REQUEST: ${{ github.event.comment.body }}
+        run: |
+          gh "$KIND" view "$NUMBER" --json title,body,comments > tmp/tidewave-context.json
+          if [ "$KIND" = pr ]; then
+            gh pr diff "$NUMBER" > tmp/tidewave-pr.diff
+          fi
+          cat > tmp/codex-prompt.md <<'PROMPT'
+          Read tmp/tidewave-context.json for the issue or pull request context.
+          For a pull request, also read tmp/tidewave-pr.diff and the conversation,
+          including your earlier replies, before making further changes.
+          Follow the request below and summarize your changes and verification in
+          your final answer. A later workflow step posts that answer to GitHub.
+
+          The app is running at http://localhost:4000 with Tidewave, in the dev environment. Use the Tidewave MCP tools to evaluate code in the app and to verify your changes in the browser. It reloads code changes automatically, so do not start another server with mix phx.server. The server log is in tmp/app.log. Run mix precommit before you finish and fix any issues it reports.
+
+          If you add a migration, run mix ecto.migrate. The app does not need a restart for this.
+
+          If you change config files or add dependencies, restart the app:
+          1. Run mix do deps.get + compile and fix any errors.
+          2. Call System.stop() with the Tidewave project_eval tool. The workflow starts the app again automatically.
+          3. The Tidewave tools are unavailable until the app is back up, which can take a few seconds. Wait and retry. If the app does not come back, check tmp/app.log.
+
+          Only change code when the request asks you to implement or fix something.
+          Leave your edits in the working tree: do not commit, create branches, push,
+          or open a pull request. Do not change files under .github/.
+          If you change code, write a short pull request title on one line in
+          tmp/tidewave/pr-title.txt. Your final answer will be the pull request body
+          for a new PR, or a comment on an existing PR. Explain the changes and how
+          you verified them. The workflow updates the existing branch for bot PRs.
+
+          Save screenshots and recordings under tmp/tidewave/. In your final answer, reference
+          each file by its path, such as ![The settings page](tmp/tidewave/screenshots/settings.png).
+          The workflow uploads the files and replaces these references with attachment URLs.
+          To embed a video as a player, put its reference, such as ![](tmp/tidewave/recordings/flow.webm),
+          alone in its own paragraph. Do not post the answer or upload the media yourself.
+          PROMPT
+          printf '\nRequest:\n%s\n' "$REQUEST" >> tmp/codex-prompt.md
+
+      - name: Configure Codex
+        env:
+          CODEX_CONFIG_DIR: ${{ runner.temp }}/tidewave-codex
+        run: |
+          mkdir -p "$CODEX_CONFIG_DIR"
+          cat > "$CODEX_CONFIG_DIR/config.toml" <<'CONFIG'
+          [mcp_servers.tidewave]
+          url = "${{ steps.tidewave.outputs.mcp_url }}"
+
+          [permissions.tidewave]
+          extends = ":workspace"
+
+          [permissions.tidewave.network]
+          enabled = true
+          CONFIG
+
+      - name: Run Codex
+        id: codex
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: tmp/codex-prompt.md
+          output-file: tmp/codex-answer.md
+          codex-home: ${{ runner.temp }}/tidewave-codex
+          permission-profile: tidewave
+          safety-strategy: drop-sudo
+
+      - name: Collect changes
+        id: changes
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: |
+          set -euo pipefail
+          bundle="$RUNNER_TEMP/tidewave-changes"
+          mkdir -p "$bundle/tmp"
+          git add --all -- .
+          git diff --cached --binary "$BASE_SHA" > "$bundle/changes.patch"
+          if [ ! -s "$bundle/changes.patch" ]; then
+            exit 0
+          fi
+          test -s tmp/tidewave/pr-title.txt
+          cp tmp/codex-answer.md "$bundle/body.md"
+          cp -R tmp/tidewave "$bundle/tmp/"
+          echo "present=true" >> "$GITHUB_OUTPUT"
+
+      - name: Upload changes
+        if: steps.changes.outputs.present == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tidewave-changes
+          path: ${{ runner.temp }}/tidewave-changes
+
+      - name: Post Codex answer with media
+        if: steps.changes.outputs.present != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_COMMENT_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.issue.number }}
+          KIND: ${{ steps.task.outputs.kind }}
+        run: |
+          shopt -s nullglob globstar nocaseglob
+          files=(tmp/tidewave/**/*.{png,jpg,jpeg,gif,webp,webm,mp4,mov})
+          args=(--body-file tmp/codex-answer.md)
+          for f in "${files[@]}"; do args+=(--attach "$f"); done
+
+          gh "$KIND" comment "$NUMBER" "${args[@]}"
+
+      - name: Upload app log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-log
+          path: tmp/app.log
+          if-no-files-found: ignore
+
+  publish:
+    needs: codex
+    if: needs.codex.outputs.changes == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.codex.outputs.base_sha }}
+
+      - name: Download changes
+        uses: actions/download-artifact@v4
+        with:
+          name: tidewave-changes
+          path: ${{ runner.temp }}/tidewave-changes
+
+      - name: Commit and push changes
+        id: push
+        env:
+          GH_TOKEN: ${{ secrets.GH_COMMENT_TOKEN }}
+          TARGET_BRANCH: ${{ needs.codex.outputs.branch }}
+        run: |
+          set -euo pipefail
+          bundle="$RUNNER_TEMP/tidewave-changes"
+          git apply --index "$bundle/changes.patch"
+          if ! git diff --cached --quiet -- .github; then
+            echo "Changes to .github/ are not allowed in this workflow"
+            exit 1
+          fi
+          read -r bot_id bot_login < <(gh api user --jq '[.id, .login] | @tsv')
+          title="$(head -n 1 "$bundle/tmp/tidewave/pr-title.txt")"
+          branch="${TARGET_BRANCH:-bot/tidewave-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}}"
+          git switch -c "$branch"
+          git -c core.hooksPath=/dev/null \
+            -c user.name="$bot_login" \
+            -c user.email="${bot_id}+${bot_login}@users.noreply.github.com" \
+            commit -m "$title"
+          git push origin "HEAD:refs/heads/$branch"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+
+      - name: Publish result as the bot
+        working-directory: ${{ runner.temp }}/tidewave-changes
+        env:
+          GH_TOKEN: ${{ secrets.GH_COMMENT_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          BASE_REF: ${{ github.event.repository.default_branch }}
+          BRANCH: ${{ steps.push.outputs.branch }}
+          NUMBER: ${{ github.event.issue.number }}
+          KIND: ${{ needs.codex.outputs.kind }}
+        run: |
+          set -euo pipefail
+          title="$(head -n 1 tmp/tidewave/pr-title.txt)"
+          shopt -s nullglob globstar nocaseglob
+          files=(tmp/tidewave/**/*.{png,jpg,jpeg,gif,webp,webm,mp4,mov})
+          attachments=()
+          for f in "${files[@]}"; do attachments+=(--attach "$f"); done
+          if [ "$KIND" = pr ]; then
+            gh pr comment "$NUMBER" --body-file body.md "${attachments[@]}"
+          else
+            printf '\n\nRefs #%s\n' "$NUMBER" >> body.md
+            url="$(gh pr create --base "$BASE_REF" --head "$BRANCH" \
+              --title "$title" --body-file body.md "${attachments[@]}")"
+            gh issue comment "$NUMBER" --body "I opened $url with the changes."
+          fi
