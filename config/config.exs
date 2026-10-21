@@ -7,6 +7,19 @@
 # General application configuration
 import Config
 
+config :tidewave_test, :scopes,
+  user: [
+    default: true,
+    module: TidewaveTest.Accounts.Scope,
+    assign_key: :current_scope,
+    access_path: [:user, :id],
+    schema_key: :user_id,
+    schema_type: :id,
+    schema_table: :users,
+    test_data_fixture: TidewaveTest.AccountsFixtures,
+    test_setup_helper: :register_and_log_in_user
+  ]
+
 config :tidewave_test,
   ecto_repos: [TidewaveTest.Repo],
   generators: [timestamp_type: :utc_datetime]
