@@ -11,6 +11,7 @@ concurrency:
 jobs:
   codex:
     if: |
+      github.event.sender.login == 'SteffenDE' &&
       startsWith(github.event.comment.body, '/tidewave ')
     outputs:
       base_sha: ${{ steps.base.outputs.sha }}
