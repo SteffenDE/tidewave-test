@@ -77,14 +77,22 @@ jobs:
       - name: Run Claude Code
         id: claude
         uses: anthropics/claude-code-action@v1
+        env:
+          GH_COMMENT_TOKEN: ${{ secrets.GH_COMMENT_TOKEN }}
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           # Uncomment to use API key instead
           # anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           claude_args: |
             --mcp-config '{"mcpServers": {"tidewave": {"type": "http", "url": "${{ steps.tidewave.outputs.mcp_url }}"}}}'
-            --allowedTools "mcp__tidewave"
-            --append-system-prompt "The app is running at http://localhost:4000 with Tidewave. Use the Tidewave MCP tools to evaluate code in the app and to verify your changes in the browser."
+            --allowedTools 'mcp__tidewave,Bash(mix:*),Bash(MIX_ENV=test mix:*),Bash(GH_TOKEN=$GH_COMMENT_TOKEN gh ${{ (github.event.issue.pull_request || github.event.pull_request) && 'pr' || 'issue' }} comment ${{ github.event.issue.number || github.event.pull_request.number }}:*)'
+            --append-system-prompt 'The app is running at http://localhost:4000 with Tidewave. Use the Tidewave MCP tools to evaluate code in the app and to verify your changes in the browser. It reloads code changes automatically, so do not start another server with mix phx.server. Run mix precommit before you finish and fix any issues it reports.
+
+            If you captured screenshots or recordings with Tidewave, save them under tmp/tidewave/ and, once you are done, post them in a separate comment with:
+
+            GH_TOKEN=$GH_COMMENT_TOKEN gh ${{ (github.event.issue.pull_request || github.event.pull_request) && 'pr' || 'issue' }} comment ${{ github.event.issue.number || github.event.pull_request.number }} --body-file tmp/tidewave/report.md --attach <file> --attach <file>
+
+            In the Markdown, reference each attached file by the same path you pass to --attach, such as ![The settings page](tmp/tidewave/screenshots/settings.png), and gh replaces it with the uploaded URL. To embed a video as a player, put its reference, such as ![](tmp/tidewave/recordings/flow.webm), alone in its own paragraph, otherwise it renders as a link. Skip this comment if there are no attachments.'
 
           # Optional: Customize the trigger phrase (default: @claude)
           # trigger_phrase: "/claude"
