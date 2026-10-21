@@ -13,10 +13,12 @@ on:
 jobs:
   claude:
     if: |
-      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
-      (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+      github.event.sender.login == 'SteffenDE' && (
+        (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+        (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
+        (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
+        (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+      )
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -24,17 +26,63 @@ jobs:
       issues: write
       id-token: write
       actions: read # Required for Claude to read CI results on PRs
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
         with:
           fetch-depth: 1
 
+      - name: Set up Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.19"
+          otp-version: "28"
+
+      - name: Cache deps and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: ${{ runner.os }}-mix-dev-${{ hashFiles('mix.lock') }}
+          restore-keys: ${{ runner.os }}-mix-dev-
+
+      - name: Set up the app
+        run: mix setup
+
+      # Tidewave is a dev-only dependency, so the server runs in the dev environment
+      - name: Start the app
+        run: mix phx.server > app.log 2>&1 &
+
+      - name: Connect Tidewave
+        id: tidewave
+        uses: tidewave-ai/connect-action@v1
+        with:
+          app_url: http://localhost:4000
+          api_key: ${{ secrets.TIDEWAVE_API_KEY }}
+
       - name: Run Claude Code
         id: claude
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_args: |
+            --mcp-config '{"mcpServers": {"tidewave": {"type": "http", "url": "${{ steps.tidewave.outputs.mcp_url }}"}}}'
+            --allowedTools "mcp__tidewave"
+            --append-system-prompt "The app is running at http://localhost:4000 with Tidewave. Use the Tidewave MCP tools to evaluate code in the app and to verify your changes in the browser."
 
           # Optional: Customize the trigger phrase (default: @claude)
           # trigger_phrase: "/claude"
