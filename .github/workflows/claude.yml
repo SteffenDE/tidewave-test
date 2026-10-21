@@ -66,8 +66,15 @@ jobs:
         run: mix setup
 
       # Tidewave is a dev-only dependency, so the server runs in the dev environment
+      # The loop restarts the server whenever it exits, so the agent can restart it
       - name: Start the app
-        run: mix phx.server > app.log 2>&1 &
+        run: |
+            mkdir -p tmp
+            (while true; do
+            mix phx.server || echo "The app exited with status $?"
+            echo "Restarting the app"
+            sleep 1
+            done) > tmp/app.log 2>&1 &
 
       - name: Connect Tidewave
         id: tidewave
@@ -86,7 +93,14 @@ jobs:
           claude_args: |
             --mcp-config '{"mcpServers": {"tidewave": {"type": "http", "url": "${{ steps.tidewave.outputs.mcp_url }}"}}}'
             --allowedTools 'mcp__tidewave,Bash(mix:*),Bash(MIX_ENV=test mix:*)'
-            --append-system-prompt 'The app is running at http://localhost:4000 with Tidewave. Use the Tidewave MCP tools to evaluate code in the app and to verify your changes in the browser. It reloads code changes automatically, so do not start another server with mix phx.server. Run mix precommit before you finish and fix any issues it reports.
+            --append-system-prompt 'The app is running at http://localhost:4000 with Tidewave, in the dev environment. Use the Tidewave MCP tools to evaluate code in the app and to verify your changes in the browser. It reloads code changes automatically, so do not start another server with mix phx.server. The server log is in tmp/app.log. Run mix precommit before you finish and fix any issues it reports.
+
+            If you add a migration, run mix ecto.migrate. The app does not need a restart for this.
+
+            If you change config files or add dependencies, restart the app:
+            1. Run mix do deps.get + compile and fix any errors.
+            2. Call System.stop() with the Tidewave project_eval tool. The workflow starts the app again automatically.
+            3. The Tidewave tools are unavailable until the app is back up, which can take a few seconds. Wait and retry. If the app does not come back, check tmp/app.log.
 
             If you capture screenshots or recordings with Tidewave, save them under tmp/tidewave/. After you finish, a later workflow step posts every image and video in that directory as a separate comment, so do not post them yourself. You can write tmp/tidewave/report.md to use as the body of that comment. In it, reference each file by its path, such as ![The settings page](tmp/tidewave/screenshots/settings.png), and it is replaced with the uploaded URL. To embed a video as a player, put its reference, such as ![](tmp/tidewave/recordings/flow.webm), alone in its own paragraph, otherwise it renders as a link. Files you do not reference are appended at the end.'
 
@@ -140,5 +154,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: app-log
-          path: app.log
+          path: tmp/app.log
           if-no-files-found: ignore
